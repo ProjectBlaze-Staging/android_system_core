@@ -628,6 +628,11 @@ on post-fs
 
     # Backup/restore mechanism uses the cache partition
     mkdir /cache/backup_stage 0700 system system
+
+    # Start adbd as early as possible (in post-fs) for GSI boot debugging
+    setprop persist.sys.usb.config adb
+    setprop sys.usb.config adb
+    start adbd
     mkdir /cache/backup 0700 system system
 
     #change permissions on vmallocinfo so we can grab it from bugreports
@@ -1074,6 +1079,11 @@ on post-fs-data
     wait_for_prop keystore.module_hash.sent true
     perform_apex_config
 
+    # Force early ADB up on GSI even when vendor build.prop sets persist.sys.usb.config=none
+    setprop persist.sys.usb.config adb
+    setprop sys.usb.config adb
+    start adbd
+
     start system_aconfigd_socket_service
     exec_start mainline_aconfigd_init
     start mainline_aconfigd_socket_service
@@ -1258,6 +1268,10 @@ on boot
 
     # Define default initial receive window size in segments.
     setprop net.tcp_def_init_rwnd 60
+
+    # Expose auxiliary cameras (Ultra-Wide / Telephoto) to Aperture on Qualcomm Snapdragon & MediaTek HALs
+    setprop vendor.camera.aux.packagelist org.lineageos.aperture,com.android.camera,com.sec.android.app.camera
+    setprop persist.vendor.camera.privapp.list org.lineageos.aperture,com.android.camera,com.sec.android.app.camera
 
     # Start standard binderized HAL daemons
     class_start hal

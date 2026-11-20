@@ -52,13 +52,20 @@
 #include "selinux.h"
 
 #include <android/api-level.h>
+#include <dirent.h>
+#include <elf.h>
 #include <fcntl.h>
 #include <linux/audit.h>
 #include <linux/netlink.h>
 #include <stdlib.h>
 #include <sys/mount.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
+#include <sys/xattr.h>
 #include <unistd.h>
+
+#include <unordered_map>
+#include <unordered_set>
 
 #include <android-base/chrono_utils.h>
 #include <android-base/file.h>
@@ -226,6 +233,116 @@ struct PolicyFile {
     std::string path;
 };
 
+static void CollectCilDefinedTypes(const std::string& path,
+                                   std::unordered_set<std::string>* out_types) {
+    if (path.empty() || access(path.c_str(), R_OK) != 0) return;
+    std::string content;
+    if (!android::base::ReadFileToString(path, &content)) return;
+    const char* prefixes[] = {"(type ", "(typeattribute "};
+    for (const char* prefix : prefixes) {
+        size_t plen = strlen(prefix);
+        size_t pos = 0;
+        while ((pos = content.find(prefix, pos)) != std::string::npos) {
+            size_t start = pos + plen;
+            while (start < content.size() && (content[start] == ' ' || content[start] == '\t')) {
+                ++start;
+            }
+            size_t end = start;
+            while (end < content.size() && content[end] != ')' && content[end] != ' ' &&
+                   content[end] != '\t' && content[end] != '\n' && content[end] != '\r') {
+                ++end;
+            }
+            if (end > start) {
+                out_types->emplace(content.substr(start, end - start));
+            }
+            pos = end;
+        }
+    }
+}
+
+static bool SynthesizeLegacyVendorMapping(const std::string& vend_plat_vers,
+                                          const std::string& plat_cil,
+                                          const std::string& sys_ext_cil,
+                                          const std::string& product_cil,
+                                          const std::string& vendor_pub_cil,
+                                          const std::string& out_mapping_path) {
+    std::string pub_content;
+    if (!android::base::ReadFileToString(vendor_pub_cil, &pub_content)) {
+        return false;
+    }
+
+    std::string vers_underscored = android::base::StringReplace(vend_plat_vers, ".", "_", true);
+    std::string suffix = "_" + vers_underscored;
+
+    std::unordered_set<std::string> known_types;
+    CollectCilDefinedTypes(plat_cil, &known_types);
+    CollectCilDefinedTypes(sys_ext_cil, &known_types);
+    CollectCilDefinedTypes(product_cil, &known_types);
+
+    // Harvest 31.0 mapping aliases if present (handles types renamed between 30.0/31.0 and ToT)
+    std::unordered_map<std::string, std::string> map_31;
+    std::string cil_31;
+    if (android::base::ReadFileToString("/system/etc/selinux/mapping/31.0.cil", &cil_31)) {
+        const std::string kTag = "(typeattributeset ";
+        size_t pos = 0;
+        while ((pos = cil_31.find(kTag, pos)) != std::string::npos) {
+            size_t s1 = pos + kTag.size();
+            size_t e1 = cil_31.find(' ', s1);
+            if (e1 == std::string::npos) break;
+            std::string attr = cil_31.substr(s1, e1 - s1);
+            if (android::base::EndsWith(attr, "_31_0")) {
+                size_t lp = cil_31.find('(', e1);
+                size_t rp = (lp != std::string::npos) ? cil_31.find(')', lp + 1) : std::string::npos;
+                if (lp != std::string::npos && rp != std::string::npos && rp > lp + 1) {
+                    std::string base = attr.substr(0, attr.size() - 5);
+                    std::string target = android::base::Trim(cil_31.substr(lp + 1, rp - lp - 1));
+                    if (!target.empty() && target.find(' ') == std::string::npos) {
+                        map_31[base] = target;
+                    }
+                }
+            }
+            pos = e1;
+        }
+    }
+
+    std::string out;
+    out.reserve(160 * 1024);
+    std::unordered_set<std::string> emitted_stubs;
+
+    const std::string kAttrPrefix = "(typeattribute ";
+    size_t pos = 0;
+    while ((pos = pub_content.find(kAttrPrefix, pos)) != std::string::npos) {
+        size_t start = pos + kAttrPrefix.size();
+        while (start < pub_content.size() && pub_content[start] == ' ') ++start;
+        size_t end = start;
+        while (end < pub_content.size() && pub_content[end] != ')' && pub_content[end] != ' ' &&
+               pub_content[end] != '\n' && pub_content[end] != '\r') {
+            ++end;
+        }
+        if (end > start) {
+            std::string attr = pub_content.substr(start, end - start);
+            if (attr.size() > suffix.size() && android::base::EndsWith(attr, suffix)) {
+                std::string base = attr.substr(0, attr.size() - suffix.size());
+                std::string target = base;
+                auto it31 = map_31.find(base);
+                if (it31 != map_31.end()) {
+                    target = it31->second;
+                }
+                if (known_types.find(target) == known_types.end() &&
+                    emitted_stubs.insert(target).second) {
+                    out += "(type " + target + ")\n";
+                    out += "(roletype object_r " + target + ")\n";
+                }
+                out += "(typeattributeset " + attr + " (" + target + "))\n";
+            }
+        }
+        pos = end;
+    }
+
+    out += "(allow domain ashmem_libcutils_device (chr_file (open)))\n";
+    return android::base::WriteStringToFile(out, out_mapping_path, 0600, 0, 0);
+}
+
 bool OpenSplitPolicy(PolicyFile* policy_file) {
     // IMPLEMENTATION NOTE: Split policy consists of three or more CIL files:
     // * platform -- policy needed due to logic contained in the system image,
@@ -323,6 +440,24 @@ bool OpenSplitPolicy(PolicyFile* policy_file) {
         return false;
     }
 
+    // Legacy Treble vendor fallback (e.g. API 28-30 vendors like Redmi Note 11 'spes' where
+    // /system/etc/selinux/mapping/30.0.cil is absent in Android 17). Never runs on 31.0+ / 202404+.
+    std::string synthesized_mapping_file;
+    if (access(plat_mapping_file.c_str(), F_OK) == -1) {
+        synthesized_mapping_file = "/dev/compat_mapping_" + vend_plat_vers + ".cil";
+        const std::string effective_plat_cil =
+                use_userdebug_policy ? std::string(*userdebug_plat_sepolicy)
+                                     : std::string(plat_policy_cil_file);
+        if (SynthesizeLegacyVendorMapping(vend_plat_vers, effective_plat_cil,
+                                          system_ext_policy_cil_file, product_policy_cil_file,
+                                          plat_pub_versioned_cil_file, synthesized_mapping_file)) {
+            LOG(INFO) << "Synthesized SELinux compatibility mapping for vendor " << vend_plat_vers;
+            plat_mapping_file = synthesized_mapping_file;
+        } else {
+            synthesized_mapping_file.clear();
+        }
+    }
+
     // odm_sepolicy.cil is default but optional.
     std::string odm_policy_cil_file("/odm/etc/selinux/odm_sepolicy.cil");
     if (access(odm_policy_cil_file.c_str(), F_OK) == -1) {
@@ -391,7 +526,11 @@ bool OpenSplitPolicy(PolicyFile* policy_file) {
     }
     compile_args.push_back(nullptr);
 
-    if (ForkExecveAndWaitForCompletion(compile_args[0], (char**)compile_args.data()) != 0) {
+    int secilc_rc = ForkExecveAndWaitForCompletion(compile_args[0], (char**)compile_args.data());
+    if (!synthesized_mapping_file.empty()) {
+        unlink(synthesized_mapping_file.c_str());
+    }
+    if (secilc_rc != 0) {
         unlink(compiled_sepolicy);
         return false;
     }
@@ -782,6 +921,148 @@ bool EarlySetupOverlays() {
 void SetupOverlays() {}
 #endif
 
+static void CopySelinuxXattrAndBindMount(const std::string& src_path, const std::string& dst_path) {
+    char con[256] = {};
+    ssize_t len = lgetxattr(src_path.c_str(), XATTR_NAME_SELINUX, con, sizeof(con) - 1);
+    if (len > 0) {
+        lsetxattr(dst_path.c_str(), XATTR_NAME_SELINUX, con, len, 0);
+    }
+    chmod(dst_path.c_str(), 0644);
+    if (mount(dst_path.c_str(), src_path.c_str(), nullptr, MS_BIND, nullptr) == 0) {
+        LOG(INFO) << "Applied vendor compat bind-mount for " << src_path;
+    } else {
+        PLOG(WARNING) << "Failed vendor compat bind-mount for " << src_path;
+    }
+}
+
+static void PatchVendorCompatFiles() {
+    constexpr const char* kCompatDir = "/dev/__vendor_compat";
+    mkdir(kCompatDir, 0755);
+
+    // 1. Patch restrictive mremap seccomp rules in older vendor C2/media policies
+    //    so Android 15+ Bionic mremap(MREMAP_MAYMOVE) does not trigger SIGSYS.
+    //    Uses distinct vendor/odm prefixes and replaces the full mremap rule line so
+    //    compound expressions (e.g. "mremap: arg3 == 3 || ...") never become invalid syntax.
+    struct SeccompDirSpec {
+        const char* dir_path;
+        const char* out_prefix;
+    };
+    static constexpr SeccompDirSpec kSeccompDirs[] = {
+        {"/vendor/etc/seccomp_policy", "vendor_seccomp_"},
+        {"/odm/etc/seccomp_policy", "odm_seccomp_"},
+    };
+    for (const auto& spec : kSeccompDirs) {
+        std::unique_ptr<DIR, decltype(&closedir)> dir(opendir(spec.dir_path), closedir);
+        if (!dir) continue;
+        while (struct dirent* de = readdir(dir.get())) {
+            if (de->d_name[0] == '.') continue;
+            std::string src_path = std::string(spec.dir_path) + "/" + de->d_name;
+            std::string content;
+            if (!android::base::ReadFileToString(src_path, &content)) continue;
+            if (content.find("mremap:") == std::string::npos) continue;
+
+            bool modified = false;
+            std::vector<std::string> lines = android::base::Split(content, "\n");
+            for (std::string& line : lines) {
+                std::string trimmed = android::base::Trim(line);
+                if (android::base::StartsWith(trimmed, "mremap:") && trimmed != "mremap: 1") {
+                    line = "mremap: 1";
+                    modified = true;
+                }
+            }
+            if (!modified) continue;
+
+            std::string patched = android::base::Join(lines, '\n');
+            std::string dst_path = std::string(kCompatDir) + "/" + spec.out_prefix + de->d_name;
+            if (android::base::WriteStringToFile(patched, dst_path, 0644, 0, 0)) {
+                CopySelinuxXattrAndBindMount(src_path, dst_path);
+            }
+        }
+    }
+
+    // 2. Patch Samsung Exynos NPU libeden_osal.so eden_mem_free() uninitialized munmap size bug:
+    //    Under Scudo, [x19, #0x10] (mem->alloc_size) is uninitialized on NPU buffer close,
+    //    causing munmap(user_ptr, garbage) to unmap camera.provider@4.0-service_64's own VMAs.
+    //    Strictly gated on exact ELF64 AArch64 + unique 8-byte instruction sequence + bl call.
+    const std::string eden_src = "/vendor/lib64/libeden_osal.so";
+    std::string eden_data;
+    if (android::base::ReadFileToString(eden_src, &eden_data) &&
+        eden_data.size() >= sizeof(Elf64_Ehdr) &&
+        memcmp(eden_data.data(), ELFMAG, SELFMAG) == 0) {
+        const auto* ehdr = reinterpret_cast<const Elf64_Ehdr*>(eden_data.data());
+        if (ehdr->e_ident[EI_CLASS] == ELFCLASS64 && ehdr->e_machine == EM_AARCH64) {
+            // ldr x0, [x19, #0x20] (60 12 40 f9); ldr x1, [x19, #0x10] (61 0a 40 f9)
+            static constexpr uint8_t kEdenMunmapSeq[8] = {
+                0x60, 0x12, 0x40, 0xf9, 0x61, 0x0a, 0x40, 0xf9,
+            };
+            void* first_hit = memmem(eden_data.data(), eden_data.size(),
+                                     kEdenMunmapSeq, sizeof(kEdenMunmapSeq));
+            if (first_hit != nullptr) {
+                size_t hit_off = static_cast<const uint8_t*>(first_hit) -
+                                 reinterpret_cast<const uint8_t*>(eden_data.data());
+                // Ensure the sequence is unique in the binary and immediately followed by `bl`
+                bool unique_hit =
+                        (hit_off + 12 <= eden_data.size()) &&
+                        (memmem(eden_data.data() + hit_off + 1, eden_data.size() - hit_off - 1,
+                                kEdenMunmapSeq, sizeof(kEdenMunmapSeq)) == nullptr);
+                uint8_t bl_top = (hit_off + 12 <= eden_data.size())
+                                         ? static_cast<uint8_t>(eden_data[hit_off + 11])
+                                         : 0;
+                if (unique_hit && (bl_top & 0xfc) == 0x94) {
+                    // Rewrite ldr x1, [x19, #0x10] -> ldr x1, [x19, #0x8] (mem->size)
+                    eden_data[hit_off + 5] = static_cast<char>(0x06);
+                    std::string eden_dst = std::string(kCompatDir) + "/vendor_lib64_libeden_osal.so";
+                    if (android::base::WriteStringToFile(eden_data, eden_dst, 0644, 0, 0)) {
+                        CopySelinuxXattrAndBindMount(eden_src, eden_dst);
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. Patch Samsung Exynos Audio HAL (audio.primary.*.so) get_device_id_from_input()
+    //    so AUDIO_DEVICE_IN_BACK_MIC (0x1f) calls check_device_builtin_mic() and routes
+    //    camcorder-multi-mic instead of single-mic camcorder-2nd-mic during 3-mic RecordAlive.
+    //    Uses separate 32-bit/64-bit output prefixes so 64-bit never overwrites 32-bit!
+    struct AudioHalDirSpec {
+        const char* dir_path;
+        const char* out_prefix;
+    };
+    static constexpr AudioHalDirSpec kAudioHalDirs[] = {
+        {"/vendor/lib/hw", "vendor_lib32_"},
+        {"/vendor/lib64/hw", "vendor_lib64_"},
+    };
+    const uint8_t kAudioInTbbOrig[20] = {
+        0xdf, 0xe8, 0x01, 0xf0, 0x06, 0x05, 0x10, 0x05, 0x16, 0x05,
+        0x05, 0x05, 0x05, 0x1b, 0xdf, 0xe7, 0x40, 0x46, 0x1e, 0x21,
+    };
+    const uint8_t kAudioInTbbPatch[20] = {
+        0xdf, 0xe8, 0x01, 0xf0, 0x06, 0x06, 0x10, 0x05, 0x16, 0x05,
+        0x05, 0x05, 0x05, 0x1b, 0xdf, 0xe7, 0x01, 0x46, 0x40, 0x46,
+    };
+    for (const auto& spec : kAudioHalDirs) {
+        std::unique_ptr<DIR, decltype(&closedir)> dir(opendir(spec.dir_path), closedir);
+        if (!dir) continue;
+        while (struct dirent* de = readdir(dir.get())) {
+            if (!android::base::StartsWith(de->d_name, "audio.primary.") ||
+                !android::base::EndsWith(de->d_name, ".so")) {
+                continue;
+            }
+            std::string src_path = std::string(spec.dir_path) + "/" + de->d_name;
+            std::string hal_data;
+            if (!android::base::ReadFileToString(src_path, &hal_data)) continue;
+            void* match = memmem(hal_data.data(), hal_data.size(),
+                                 kAudioInTbbOrig, sizeof(kAudioInTbbOrig));
+            if (!match) continue;
+            memcpy(match, kAudioInTbbPatch, sizeof(kAudioInTbbPatch));
+            std::string dst_path = std::string(kCompatDir) + "/" + spec.out_prefix + de->d_name;
+            if (android::base::WriteStringToFile(hal_data, dst_path, 0644, 0, 0)) {
+                CopySelinuxXattrAndBindMount(src_path, dst_path);
+            }
+        }
+    }
+}
+
 int SetupSelinux(char** argv) {
     SetStdioToDevNull(argv);
     InitKernelLogging(argv);
@@ -802,6 +1083,7 @@ int SetupSelinux(char** argv) {
         LoadSelinuxPolicyMicrodroid();
     } else {
         LoadSelinuxPolicyAndroid();
+        PatchVendorCompatFiles();
     }
 
     SelinuxSetEnforcement();

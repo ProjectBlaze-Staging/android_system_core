@@ -129,7 +129,15 @@ static UeventdConfiguration GetConfiguration() {
         return ParseConfig({"/system/etc/ueventd.rc", "/vendor/etc/ueventd.rc"});
     }
 
-    return ParseConfig({"/system/etc/ueventd.rc"});
+    auto hardware = android::base::GetProperty("ro.hardware", "");
+    std::vector<std::string> canonical{
+            "/system/etc/ueventd.rc",
+            "/vendor/ueventd.rc",
+            "/odm/ueventd.rc",
+            "/ueventd." + hardware + ".rc",
+    };
+
+    return ParseConfig(canonical);
 }
 
 void main_loop(const UeventListener& uevent_listener,
